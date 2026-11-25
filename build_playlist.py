@@ -146,6 +146,11 @@ def clean_alnum(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", strip_accents(text).lower())
 
 
+def extract_attr(meta_part: str, attr_name: str) -> str:
+    match = re.search(rf'{re.escape(attr_name)}="([^"]*)"', meta_part)
+    return match.group(1).strip() if match else ""
+
+
 def fetch_bytes(url: str) -> bytes:
     req = urllib.request.Request(
         url,
@@ -164,7 +169,6 @@ def fetch_bytes(url: str) -> bytes:
 
 
 def extract_icon_url(channel_elem: ET.Element) -> str:
-    """Lấy link icon từ thẻ <icon> của kênh trong EPG (src, url, href hoặc text)."""
     for icon_el in channel_elem.findall("icon"):
         url = (
             icon_el.attrib.get("src")
@@ -178,11 +182,6 @@ def extract_icon_url(channel_elem: ET.Element) -> str:
 
 
 def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]]:
-    """
-    Trả về:
-    - icons_by_id: {channel_id: icon_url}
-    - name_to_id: {normalized_display_name: channel_id}
-    """
     icons_by_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
     context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
@@ -289,7 +288,6 @@ def find_icon_url(
     icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
 ) -> str:
-    """Lấy link icon từ EPG (https://lichphatsong.io.vn/epg.xml) cho kênh."""
     if not icons_by_id:
         return ""
 
@@ -314,11 +312,12 @@ def build_m3u(
     m3u_text: str,
     icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, int]:
     lines = [line.strip() for line in m3u_text.splitlines() if line.strip()]
     out_lines = ["#EXTM3U"]
     total = 0
-    with_logo = 0
+    kept_existing = 0
+    fetched_from_epg = 0
 
     i = 0
     while i < len(lines):
@@ -327,11 +326,19 @@ def build_m3u(
             meta_part, title = line.split(",", 1) if "," in line else (line, "")
             title = title.strip()
 
-            tvg_id_match = re.search(r'tvg-id="([^"]*)"', meta_part)
-            old_tvg_id = tvg_id_match.group(1).strip() if tvg_id_match else ""
+            old_tvg_id = extract_attr(meta_part, "tvg-id")
+            existing_tvg_logo = extract_attr(meta_part, "tvg-logo")
+            existing_tv_logo = extract_attr(meta_part, "tv-logo")
+            existing_logo = existing_tvg_logo or existing_tv_logo
 
             matched_id = resolve_epg_id(old_tvg_id, title, icons_by_id, name_to_id)
-            logo_url = find_icon_url(matched_id, old_tvg_id, title, icons_by_id, name_to_id)
+
+            if existing_logo:
+                logo_url = existing_logo
+                source_type = "existing"
+            else:
+                logo_url = find_icon_url(matched_id, old_tvg_id, title, icons_by_id, name_to_id)
+                source_type = "epg" if logo_url else "none"
 
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
@@ -348,13 +355,15 @@ def build_m3u(
 
             if stream_url:
                 total += 1
-                if logo_url:
-                    with_logo += 1
+                if source_type == "existing":
+                    kept_existing += 1
+                elif source_type == "epg":
+                    fetched_from_epg += 1
                 out_lines.append(new_extinf)
                 out_lines.append(stream_url)
         i += 1
 
-    return "\n".join(out_lines) + "\n", total, with_logo
+    return "\n".join(out_lines) + "\n", total, kept_existing, fetched_from_epg
 
 
 def main():
@@ -384,9 +393,12 @@ def main():
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
 
-    result_m3u, total, with_logo = build_m3u(m3u_text, icons_by_id, name_to_id)
+    result_m3u, total, kept_existing, fetched_from_epg = build_m3u(m3u_text, icons_by_id, name_to_id)
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
-    print(f"Hoàn tất! Đã xuất {total} kênh ra {OUTPUT_FILE} (có logo từ EPG: {with_logo} kênh).")
+    print(
+        f"Hoàn tất! Xuất {total} kênh ra {OUTPUT_FILE} "
+        f"(giữ logo cũ: {kept_existing}, lấy mới từ EPG: {fetched_from_epg})."
+    )
 
 
 if __name__ == "__main__":
