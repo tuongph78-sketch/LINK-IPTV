@@ -1,5 +1,6 @@
 import gzip
 import io
+import os
 import re
 import sys
 import urllib.error
@@ -7,13 +8,16 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import os
-
 M3U_URL = os.getenv(
     "M3U_URL",
     "https://raw.githubusercontent.com/iptv-org/iptv/refs/heads/master/streams/vn.m3u",
 )
 EPG_URL = os.getenv("EPG_URL", "https://lichphatsong.io.vn/epg.xml")
+# Link EPG chuyên lấy logo (nếu không đặt thì dùng chung EPG_URL)
+TV_LOGO_EPG_URL = (
+    os.getenv("TV_LOGO_EPG_URL") or os.getenv("EPG_LOGO_URL") or EPG_URL
+).strip()
+
 FALLBACK_EPG_FILE = Path("epg_fallback.xml")
 OUTPUT_FILE = Path("output.m3u")
 
@@ -153,12 +157,24 @@ def parse_epg_channels(xml_bytes: bytes) -> dict[str, str]:
     return channels
 
 
+def load_epg_logos_from_url(url: str, label: str) -> dict[str, str]:
+    try:
+        xml_bytes = fetch_bytes(url)
+        logos = parse_epg_channels(xml_bytes)
+        print(f"Đã lấy {len(logos)} logo kênh từ {label}.")
+        return logos
+    except urllib.error.HTTPError as e:
+        print(f"Cảnh báo: Không tải được {label} (HTTP {e.code} {e.reason}).", file=sys.stderr)
+    except Exception as e:
+        print(f"Cảnh báo: Lỗi xử lý {label} ({e}).", file=sys.stderr)
+    return {}
+
+
 def normalize_key(text: str) -> str:
     return re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", text).strip().lower()
 
 
 def resolve_epg_id(old_tvg_id: str, title: str, epg_channels: dict[str, str]) -> str:
-    # Khi không tải được EPG online, vẫn giữ nguyên tvg-id gốc hoặc ánh xạ đã biết
     mapped_default = TVG_ID_MAP.get(old_tvg_id, old_tvg_id)
     if not epg_channels:
         return mapped_default
@@ -183,9 +199,10 @@ def resolve_epg_id(old_tvg_id: str, title: str, epg_channels: dict[str, str]) ->
     return mapped_default
 
 
-def build_m3u(m3u_text: str, epg_channels: dict[str, str]) -> str:
+def build_m3u(m3u_text: str, epg_channels: dict[str, str], logo_channels: dict[str, str]) -> str:
     lines = [line.strip() for line in m3u_text.splitlines() if line.strip()]
     out_lines = ["#EXTM3U"]
+    logo_pool = logo_channels or epg_channels
 
     i = 0
     while i < len(lines):
@@ -198,12 +215,16 @@ def build_m3u(m3u_text: str, epg_channels: dict[str, str]) -> str:
             old_tvg_id = tvg_id_match.group(1).strip() if tvg_id_match else ""
 
             matched_id = resolve_epg_id(old_tvg_id, title, epg_channels)
-            logo_url = epg_channels.get(matched_id, "") if epg_channels else ""
+            logo_matched_id = resolve_epg_id(old_tvg_id, title, logo_pool) if logo_channels else matched_id
+            logo_url = logo_pool.get(logo_matched_id, "") if logo_pool else ""
 
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
 
-            new_extinf = f'{prefix} tvg-id="{matched_id}" tvg-logo="{logo_url}",{title}'
+            new_extinf = (
+                f'{prefix} tvg-id="{matched_id}" '
+                f'tvg-logo="{logo_url}" tv-logo="{logo_url}",{title}'
+            )
 
             stream_url = ""
             if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
@@ -226,24 +247,19 @@ def main():
         print(f"Lỗi khi tải M3U: {e}", file=sys.stderr)
         sys.exit(1)
 
-    epg_channels: dict[str, str] = {}
-    try:
-        epg_bytes = fetch_bytes(EPG_URL)
-        epg_channels = parse_epg_channels(epg_bytes)
-        print(f"Đã đọc {len(epg_channels)} kênh từ EPG.")
-    except urllib.error.HTTPError as e:
-        print(f"Cảnh báo: Không tải được EPG (HTTP {e.code} {e.reason}).", file=sys.stderr)
-    except Exception as e:
-        print(f"Cảnh báo: Lỗi xử lý EPG ({e}).", file=sys.stderr)
+    epg_channels = load_epg_logos_from_url(EPG_URL, "EPG chính")
+    logo_channels: dict[str, str] = {}
+    if TV_LOGO_EPG_URL and TV_LOGO_EPG_URL != EPG_URL:
+        logo_channels = load_epg_logos_from_url(TV_LOGO_EPG_URL, "EPG logo")
 
-    if not epg_channels and FALLBACK_EPG_FILE.exists():
+    if not epg_channels and not logo_channels and FALLBACK_EPG_FILE.exists():
         try:
             epg_channels = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
             print(f"Đã đọc {len(epg_channels)} kênh từ {FALLBACK_EPG_FILE}.")
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
 
-    result_m3u = build_m3u(m3u_text, epg_channels)
+    result_m3u = build_m3u(m3u_text, epg_channels, logo_channels)
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
     print(f"Hoàn tất! Đã xuất file: {OUTPUT_FILE}")
 
