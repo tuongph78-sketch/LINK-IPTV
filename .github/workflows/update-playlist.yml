@@ -1,0 +1,46 @@
+name: Build IPTV Playlist
+
+on:
+  schedule:
+    # Chạy tự động mỗi 6 tiếng (UTC): 00:00, 06:00, 12:00, 18:00
+    - cron: "0 */6 * * *"
+  workflow_dispatch: # Cho phép bấm "Run workflow" thủ công ngay trên GitHub
+
+concurrency:
+  group: build-iptv-playlist-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run build_playlist.py
+        env:
+          EPG_URL: ${{ secrets.EPG_URL || 'https://lichphatsong.io.vn/epg.xml' }}
+        run: python build_playlist.py
+
+      - name: Commit and push output.m3u if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output.m3u
+          if git diff --staged --quiet; then
+            echo "Không có thay đổi trong output.m3u"
+          else
+            git commit -m "Update output.m3u"
+            git pull --rebase origin main --autostash
+            git push origin HEAD:main
+          fi
