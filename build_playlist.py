@@ -163,26 +163,37 @@ def fetch_bytes(url: str) -> bytes:
     return data
 
 
+def extract_icon_url(channel_elem: ET.Element) -> str:
+    """Lấy link icon từ thẻ <icon> của kênh trong EPG (src, url hoặc text bên trong)."""
+    for icon_el in channel_elem.findall("icon"):
+        url = (
+            icon_el.attrib.get("src")
+            or icon_el.attrib.get("url")
+            or icon_el.attrib.get("href")
+            or (icon_el.text or "")
+        ).strip()
+        if url:
+            return url
+    return ""
+
+
 def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]]:
     """
     Trả về:
-    - logos_by_id: {channel_id: icon_src}
+    - icons_by_id: {channel_id: icon_url}
     - name_to_id: {normalized_display_name: channel_id}
     """
-    logos_by_id: dict[str, str] = {}
+    icons_by_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
     context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
     for _, elem in context:
         if elem.tag == "channel":
             ch_id = (elem.attrib.get("id") or "").strip()
             if ch_id:
-                icon_el = elem.find("icon")
-                icon_src = ""
-                if icon_el is not None:
-                    icon_src = (
-                        icon_el.attrib.get("src") or icon_el.attrib.get("url") or ""
-                    ).strip()
-                logos_by_id[ch_id] = icon_src
+                icon_url = extract_icon_url(elem)
+                # Chỉ ghi đè nếu chưa có hoặc link mới có icon
+                if ch_id not in icons_by_id or icon_url:
+                    icons_by_id[ch_id] = icon_url
 
                 for disp_el in elem.findall("display-name"):
                     disp_text = (disp_el.text or "").strip()
@@ -196,9 +207,9 @@ def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]
             elem.clear()
         elif elem.tag == "programme":
             elem.clear()
-            if logos_by_id:
+            if icons_by_id:
                 break
-    return logos_by_id, name_to_id
+    return icons_by_id, name_to_id
 
 
 def candidate_ids_from_raw(raw_id: str, title: str) -> list[str]:
@@ -238,10 +249,9 @@ def candidate_ids_from_raw(raw_id: str, title: str) -> list[str]:
 def resolve_epg_id(
     old_tvg_id: str,
     title: str,
-    logos_by_id: dict[str, str],
+    icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
 ) -> str:
-    # 1. Tra trực tiếp trong TVG_ID_MAP
     mapped_default = TVG_ID_MAP.get(old_tvg_id, "")
     if not mapped_default and old_tvg_id:
         for k, v in TVG_ID_MAP.items():
@@ -249,26 +259,23 @@ def resolve_epg_id(
                 mapped_default = v
                 break
 
-    if not logos_by_id:
+    if not icons_by_id:
         return mapped_default or old_tvg_id
 
-    if mapped_default and mapped_default in logos_by_id:
+    if mapped_default and mapped_default in icons_by_id:
         return mapped_default
 
-    # 2. Thử các ứng viên ID chuẩn hóa (bao gồm cả trường hợp bỏ @HD/@SD hoặc thêm hd)
     for cand in candidate_ids_from_raw(old_tvg_id, title):
-        if cand in logos_by_id:
+        if cand in icons_by_id:
             return cand
 
-    # 3. Tra theo bảng TITLE_FALLBACK_MAP
     clean_title = normalize_key(title)
     no_accent_title = clean_alnum(title)
     for key in (clean_title, no_accent_title):
         mapped_title_id = TITLE_FALLBACK_MAP.get(key)
-        if mapped_title_id and mapped_title_id in logos_by_id:
+        if mapped_title_id and mapped_title_id in icons_by_id:
             return mapped_title_id
 
-    # 4. Đối chiếu trực tiếp với display-name trong EPG
     for key in (clean_title, no_accent_title):
         if key and key in name_to_id:
             return name_to_id[key]
@@ -276,9 +283,29 @@ def resolve_epg_id(
     return mapped_default or old_tvg_id
 
 
+def find_icon_url(
+    matched_id: str,
+    old_tvg_id: str,
+    title: str,
+    icons_by_id: dict[str, str],
+) -> str:
+    """Lấy link icon từ EPG theo matched_id, nếu trống thì thử các ID ứng viên khác có icon."""
+    if not icons_by_id:
+        return ""
+
+    if matched_id and icons_by_id.get(matched_id):
+        return icons_by_id[matched_id]
+
+    for cand in candidate_ids_from_raw(old_tvg_id, title):
+        if icons_by_id.get(cand):
+            return icons_by_id[cand]
+
+    return ""
+
+
 def build_m3u(
     m3u_text: str,
-    logos_by_id: dict[str, str],
+    icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
 ) -> str:
     lines = [line.strip() for line in m3u_text.splitlines() if line.strip()]
@@ -294,15 +321,15 @@ def build_m3u(
             tvg_id_match = re.search(r'tvg-id="([^"]*)"', meta_part)
             old_tvg_id = tvg_id_match.group(1).strip() if tvg_id_match else ""
 
-            matched_id = resolve_epg_id(old_tvg_id, title, logos_by_id, name_to_id)
-            logo_url = logos_by_id.get(matched_id, "") if logos_by_id else ""
+            matched_id = resolve_epg_id(old_tvg_id, title, icons_by_id, name_to_id)
+            tv_logo_url = find_icon_url(matched_id, old_tvg_id, title, icons_by_id)
 
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
 
             new_extinf = (
-                f'{prefix} tvg-id="{matched_id}" tv-id="{matched_id}" '
-                f'tvg-logo="{logo_url}" tv-logo="{logo_url}",{title}'
+                f'{prefix} tvg-id="{matched_id}" '
+                f'tvg-logo="{tv_logo_url}" tv-logo="{tv_logo_url}",{title}'
             )
 
             stream_url = ""
@@ -326,26 +353,26 @@ def main():
         print(f"Lỗi khi tải M3U: {e}", file=sys.stderr)
         sys.exit(1)
 
-    logos_by_id: dict[str, str] = {}
+    icons_by_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
 
     try:
         epg_bytes = fetch_bytes(EPG_URL)
-        logos_by_id, name_to_id = parse_epg_channels(epg_bytes)
-        print(f"Đã đọc {len(logos_by_id)} kênh từ EPG.")
+        icons_by_id, name_to_id = parse_epg_channels(epg_bytes)
+        print(f"Đã đọc {len(icons_by_id)} kênh từ EPG.")
     except urllib.error.HTTPError as e:
         print(f"Cảnh báo: Không tải được EPG (HTTP {e.code} {e.reason}).", file=sys.stderr)
     except Exception as e:
         print(f"Cảnh báo: Lỗi xử lý EPG ({e}).", file=sys.stderr)
 
-    if not logos_by_id and FALLBACK_EPG_FILE.exists():
+    if not icons_by_id and FALLBACK_EPG_FILE.exists():
         try:
-            logos_by_id, name_to_id = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
-            print(f"Đã đọc {len(logos_by_id)} kênh từ {FALLBACK_EPG_FILE}.")
+            icons_by_id, name_to_id = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
+            print(f"Đã đọc {len(icons_by_id)} kênh từ {FALLBACK_EPG_FILE}.")
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
 
-    result_m3u = build_m3u(m3u_text, logos_by_id, name_to_id)
+    result_m3u = build_m3u(m3u_text, icons_by_id, name_to_id)
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
     print(f"Hoàn tất! Đã xuất file: {OUTPUT_FILE}")
 
