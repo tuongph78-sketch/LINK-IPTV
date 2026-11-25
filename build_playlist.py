@@ -3,6 +3,7 @@ import io
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -13,16 +14,12 @@ M3U_URL = os.getenv(
     "https://raw.githubusercontent.com/iptv-org/iptv/refs/heads/master/streams/vn.m3u",
 )
 EPG_URL = os.getenv("EPG_URL", "https://lichphatsong.io.vn/epg.xml")
-# Link EPG chuyên lấy logo (nếu không đặt thì dùng chung EPG_URL)
-TV_LOGO_EPG_URL = (
-    os.getenv("TV_LOGO_EPG_URL") or os.getenv("EPG_LOGO_URL") or EPG_URL
-).strip()
-
 FALLBACK_EPG_FILE = Path("epg_fallback.xml")
 OUTPUT_FILE = Path("output.m3u")
 
 TVG_ID_MAP = {
     "AnNinhTV.vn@HD": "antvhd",
+    "AnNinhTV.vn@SD": "antvhd",
     "CaMauTV.vn@SD": "camau",
     "CanThoTV.vn@SD": "cantho1",
     "CanThoTV2.vn@SD": "cantho2",
@@ -39,15 +36,24 @@ TVG_ID_MAP = {
     "GiaLaiTV.vn@SD": "gialai",
     "HaTinhTV.vn@SD": "hatinh",
     "HanoiTV1.vn@SD": "hanoi1",
+    "HanoiTV2.vn@SD": "hanoi2",
     "HTV1.vn@SD": "htv1",
+    "HTV1.vn@HD": "htv1",
     "HTV2.vn@HD": "htv2hd",
     "HTV3.vn@SD": "htv3",
+    "HTV3.vn@HD": "htv3",
     "HTV4.vn@HD": "htv4",
     "HTV5.vn@HD": "htv5",
     "HTV7.vn@HD": "htv7hd",
     "HTV7.vn@SD": "htv7hd",
+    "HTV7.vn": "htv7hd",
+    "HTV7HD.vn@HD": "htv7hd",
     "HTV9.vn@SD": "htv9hd",
+    "HTV9.vn@HD": "htv9hd",
+    "HTV9.vn": "htv9hd",
+    "HTV9HD.vn@HD": "htv9hd",
     "HTVSports.vn@SD": "htvthethaohd",
+    "HTVSports.vn@HD": "htvthethaohd",
     "HTVCFamily.vn@SD": "htvcgiadinhhd",
     "HTVCMovies.vn@SD": "htvcphimhd",
     "HTVCWomen.vn@SD": "htvcphunuhd",
@@ -112,10 +118,32 @@ TVG_ID_MAP = {
 }
 
 TITLE_FALLBACK_MAP = {
+    "htv7": "htv7hd",
+    "htv7 hd": "htv7hd",
+    "htv7 sd": "htv7hd",
+    "htv9": "htv9hd",
+    "htv9 hd": "htv9hd",
+    "htv9 sd": "htv9hd",
     "on vie drama": "onviedramas",
+    "on vie dramas": "onviedramas",
     "đồng tháp tv2": "dongthap2",
     "dong thap tv2": "dongthap2",
 }
+
+
+def strip_accents(text: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def normalize_key(text: str) -> str:
+    cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", text)
+    cleaned = re.sub(r"\b(hd|sd|fhd|4k)\b", "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip().lower()
+
+
+def clean_alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", strip_accents(text).lower())
 
 
 def fetch_bytes(url: str) -> bytes:
@@ -135,8 +163,14 @@ def fetch_bytes(url: str) -> bytes:
     return data
 
 
-def parse_epg_channels(xml_bytes: bytes) -> dict[str, str]:
-    channels: dict[str, str] = {}
+def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Trả về:
+    - logos_by_id: {channel_id: icon_src}
+    - name_to_id: {normalized_display_name: channel_id}
+    """
+    logos_by_id: dict[str, str] = {}
+    name_to_id: dict[str, str] = {}
     context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
     for _, elem in context:
         if elem.tag == "channel":
@@ -148,61 +182,107 @@ def parse_epg_channels(xml_bytes: bytes) -> dict[str, str]:
                     icon_src = (
                         icon_el.attrib.get("src") or icon_el.attrib.get("url") or ""
                     ).strip()
-                channels[ch_id] = icon_src
+                logos_by_id[ch_id] = icon_src
+
+                for disp_el in elem.findall("display-name"):
+                    disp_text = (disp_el.text or "").strip()
+                    if disp_text:
+                        norm = normalize_key(disp_text)
+                        no_accent = clean_alnum(disp_text)
+                        if norm and norm not in name_to_id:
+                            name_to_id[norm] = ch_id
+                        if no_accent and no_accent not in name_to_id:
+                            name_to_id[no_accent] = ch_id
             elem.clear()
         elif elem.tag == "programme":
             elem.clear()
-            if channels:
+            if logos_by_id:
                 break
-    return channels
+    return logos_by_id, name_to_id
 
 
-def load_epg_logos_from_url(url: str, label: str) -> dict[str, str]:
-    try:
-        xml_bytes = fetch_bytes(url)
-        logos = parse_epg_channels(xml_bytes)
-        print(f"Đã lấy {len(logos)} logo kênh từ {label}.")
-        return logos
-    except urllib.error.HTTPError as e:
-        print(f"Cảnh báo: Không tải được {label} (HTTP {e.code} {e.reason}).", file=sys.stderr)
-    except Exception as e:
-        print(f"Cảnh báo: Lỗi xử lý {label} ({e}).", file=sys.stderr)
-    return {}
+def candidate_ids_from_raw(raw_id: str, title: str) -> list[str]:
+    candidates: list[str] = []
+
+    def add(val: str) -> None:
+        v = val.strip()
+        if v and v not in candidates:
+            candidates.append(v)
+
+    if raw_id:
+        add(raw_id)
+        add(raw_id.lower())
+        no_region = re.sub(r"\.vn(@[a-z0-9]+)?$", "", raw_id, flags=re.IGNORECASE)
+        add(no_region)
+        add(no_region.lower())
+        no_qual = re.sub(r"(@(hd|sd|fhd)|(hd|sd|fhd))$", "", no_region, flags=re.IGNORECASE)
+        add(no_qual)
+        add(no_qual.lower())
+        alnum = clean_alnum(no_qual)
+        add(alnum)
+        if alnum:
+            add(f"{alnum}hd")
+            add(f"{alnum}sd")
+
+    if title:
+        clean_t = normalize_key(title)
+        add(clean_t)
+        alnum_t = clean_alnum(clean_t)
+        add(alnum_t)
+        if alnum_t:
+            add(f"{alnum_t}hd")
+
+    return candidates
 
 
-def normalize_key(text: str) -> str:
-    return re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", text).strip().lower()
+def resolve_epg_id(
+    old_tvg_id: str,
+    title: str,
+    logos_by_id: dict[str, str],
+    name_to_id: dict[str, str],
+) -> str:
+    # 1. Tra trực tiếp trong TVG_ID_MAP
+    mapped_default = TVG_ID_MAP.get(old_tvg_id, "")
+    if not mapped_default and old_tvg_id:
+        for k, v in TVG_ID_MAP.items():
+            if k.lower() == old_tvg_id.lower():
+                mapped_default = v
+                break
 
+    if not logos_by_id:
+        return mapped_default or old_tvg_id
 
-def resolve_epg_id(old_tvg_id: str, title: str, epg_channels: dict[str, str]) -> str:
-    mapped_default = TVG_ID_MAP.get(old_tvg_id, old_tvg_id)
-    if not epg_channels:
+    if mapped_default and mapped_default in logos_by_id:
         return mapped_default
 
-    if old_tvg_id in TVG_ID_MAP and TVG_ID_MAP[old_tvg_id] in epg_channels:
-        return TVG_ID_MAP[old_tvg_id]
+    # 2. Thử các ứng viên ID chuẩn hóa (bao gồm cả trường hợp bỏ @HD/@SD hoặc thêm hd)
+    for cand in candidate_ids_from_raw(old_tvg_id, title):
+        if cand in logos_by_id:
+            return cand
 
-    if old_tvg_id and old_tvg_id in epg_channels:
-        return old_tvg_id
-
-    if old_tvg_id:
-        base = re.sub(r"\.vn@(hd|sd)$", "", old_tvg_id, flags=re.IGNORECASE).lower()
-        base_clean = re.sub(r"[^a-z0-9]", "", base)
-        for cand in (base, base_clean, f"{base}hd", f"{base_clean}hd"):
-            if cand in epg_channels:
-                return cand
-
+    # 3. Tra theo bảng TITLE_FALLBACK_MAP
     clean_title = normalize_key(title)
-    if clean_title in TITLE_FALLBACK_MAP and TITLE_FALLBACK_MAP[clean_title] in epg_channels:
-        return TITLE_FALLBACK_MAP[clean_title]
+    no_accent_title = clean_alnum(title)
+    for key in (clean_title, no_accent_title):
+        mapped_title_id = TITLE_FALLBACK_MAP.get(key)
+        if mapped_title_id and mapped_title_id in logos_by_id:
+            return mapped_title_id
 
-    return mapped_default
+    # 4. Đối chiếu trực tiếp với display-name trong EPG
+    for key in (clean_title, no_accent_title):
+        if key and key in name_to_id:
+            return name_to_id[key]
+
+    return mapped_default or old_tvg_id
 
 
-def build_m3u(m3u_text: str, epg_channels: dict[str, str], logo_channels: dict[str, str]) -> str:
+def build_m3u(
+    m3u_text: str,
+    logos_by_id: dict[str, str],
+    name_to_id: dict[str, str],
+) -> str:
     lines = [line.strip() for line in m3u_text.splitlines() if line.strip()]
     out_lines = ["#EXTM3U"]
-    logo_pool = logo_channels or epg_channels
 
     i = 0
     while i < len(lines):
@@ -214,15 +294,14 @@ def build_m3u(m3u_text: str, epg_channels: dict[str, str], logo_channels: dict[s
             tvg_id_match = re.search(r'tvg-id="([^"]*)"', meta_part)
             old_tvg_id = tvg_id_match.group(1).strip() if tvg_id_match else ""
 
-            matched_id = resolve_epg_id(old_tvg_id, title, epg_channels)
-            logo_matched_id = resolve_epg_id(old_tvg_id, title, logo_pool) if logo_channels else matched_id
-            logo_url = logo_pool.get(logo_matched_id, "") if logo_pool else ""
+            matched_id = resolve_epg_id(old_tvg_id, title, logos_by_id, name_to_id)
+            logo_url = logos_by_id.get(matched_id, "") if logos_by_id else ""
 
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
 
             new_extinf = (
-                f'{prefix} tvg-id="{matched_id}" '
+                f'{prefix} tvg-id="{matched_id}" tv-id="{matched_id}" '
                 f'tvg-logo="{logo_url}" tv-logo="{logo_url}",{title}'
             )
 
@@ -247,19 +326,26 @@ def main():
         print(f"Lỗi khi tải M3U: {e}", file=sys.stderr)
         sys.exit(1)
 
-    epg_channels = load_epg_logos_from_url(EPG_URL, "EPG chính")
-    logo_channels: dict[str, str] = {}
-    if TV_LOGO_EPG_URL and TV_LOGO_EPG_URL != EPG_URL:
-        logo_channels = load_epg_logos_from_url(TV_LOGO_EPG_URL, "EPG logo")
+    logos_by_id: dict[str, str] = {}
+    name_to_id: dict[str, str] = {}
 
-    if not epg_channels and not logo_channels and FALLBACK_EPG_FILE.exists():
+    try:
+        epg_bytes = fetch_bytes(EPG_URL)
+        logos_by_id, name_to_id = parse_epg_channels(epg_bytes)
+        print(f"Đã đọc {len(logos_by_id)} kênh từ EPG.")
+    except urllib.error.HTTPError as e:
+        print(f"Cảnh báo: Không tải được EPG (HTTP {e.code} {e.reason}).", file=sys.stderr)
+    except Exception as e:
+        print(f"Cảnh báo: Lỗi xử lý EPG ({e}).", file=sys.stderr)
+
+    if not logos_by_id and FALLBACK_EPG_FILE.exists():
         try:
-            epg_channels = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
-            print(f"Đã đọc {len(epg_channels)} kênh từ {FALLBACK_EPG_FILE}.")
+            logos_by_id, name_to_id = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
+            print(f"Đã đọc {len(logos_by_id)} kênh từ {FALLBACK_EPG_FILE}.")
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
 
-    result_m3u = build_m3u(m3u_text, epg_channels, logo_channels)
+    result_m3u = build_m3u(m3u_text, logos_by_id, name_to_id)
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
     print(f"Hoàn tất! Đã xuất file: {OUTPUT_FILE}")
 
