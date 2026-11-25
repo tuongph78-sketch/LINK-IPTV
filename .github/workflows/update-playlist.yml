@@ -3,11 +3,11 @@ name: Build IPTV Playlist
 on:
   schedule:
     # Chạy tự động mỗi 6 tiếng (UTC): 00:00, 06:00, 12:00, 18:00
-    - cron: "0 */6 * * *"
-  workflow_dispatch: # Cho phép bấm "Run workflow" thủ công ngay trên GitHub
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: build-iptv-playlist-${{ github.ref }}
+  group: repo-auto-commit-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -20,10 +20,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -41,6 +41,13 @@ jobs:
             echo "Không có thay đổi trong output.m3u"
           else
             git commit -m "Update output.m3u"
-            git pull --rebase origin main --autostash
-            git push origin HEAD:main
+            for attempt in 1 2 3; do
+              git pull --rebase --autostash origin "${{ github.ref_name }}"
+              if git push origin "HEAD:${{ github.ref_name }}"; then
+                echo "Push thành công ở lần thử thứ $attempt"
+                break
+              fi
+              echo "Push bị từ chối, thử lại sau 3s..."
+              sleep 3
+            done
           fi
