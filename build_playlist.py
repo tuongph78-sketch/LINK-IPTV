@@ -13,7 +13,7 @@ M3U_URL = os.getenv(
     "M3U_URL",
     "https://raw.githubusercontent.com/iptv-org/iptv/refs/heads/master/streams/vn.m3u",
 )
-EPG_URL = os.getenv("EPG_URL", "https://lichphatsong.io.vn/epg.xml")
+EPG_URL = os.getenv("EPG_URL", "https://lichphatsong.io.vn/epg.xml").strip() or "https://lichphatsong.io.vn/epg.xml"
 FALLBACK_EPG_FILE = Path("epg_fallback.xml")
 OUTPUT_FILE = Path("output.m3u")
 
@@ -164,7 +164,7 @@ def fetch_bytes(url: str) -> bytes:
 
 
 def extract_icon_url(channel_elem: ET.Element) -> str:
-    """Lấy link icon từ thẻ <icon> của kênh trong EPG (src, url hoặc text bên trong)."""
+    """Lấy link icon từ thẻ <icon> của kênh trong EPG (src, url, href hoặc text)."""
     for icon_el in channel_elem.findall("icon"):
         url = (
             icon_el.attrib.get("src")
@@ -191,7 +191,6 @@ def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]
             ch_id = (elem.attrib.get("id") or "").strip()
             if ch_id:
                 icon_url = extract_icon_url(elem)
-                # Chỉ ghi đè nếu chưa có hoặc link mới có icon
                 if ch_id not in icons_by_id or icon_url:
                     icons_by_id[ch_id] = icon_url
 
@@ -288,8 +287,9 @@ def find_icon_url(
     old_tvg_id: str,
     title: str,
     icons_by_id: dict[str, str],
+    name_to_id: dict[str, str],
 ) -> str:
-    """Lấy link icon từ EPG theo matched_id, nếu trống thì thử các ID ứng viên khác có icon."""
+    """Lấy link icon từ EPG (https://lichphatsong.io.vn/epg.xml) cho kênh."""
     if not icons_by_id:
         return ""
 
@@ -300,6 +300,13 @@ def find_icon_url(
         if icons_by_id.get(cand):
             return icons_by_id[cand]
 
+    clean_title = normalize_key(title)
+    no_accent_title = clean_alnum(title)
+    for key in (clean_title, no_accent_title):
+        mapped_id = TITLE_FALLBACK_MAP.get(key) or name_to_id.get(key)
+        if mapped_id and icons_by_id.get(mapped_id):
+            return icons_by_id[mapped_id]
+
     return ""
 
 
@@ -307,9 +314,11 @@ def build_m3u(
     m3u_text: str,
     icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
-) -> str:
+) -> tuple[str, int, int]:
     lines = [line.strip() for line in m3u_text.splitlines() if line.strip()]
     out_lines = ["#EXTM3U"]
+    total = 0
+    with_logo = 0
 
     i = 0
     while i < len(lines):
@@ -322,14 +331,14 @@ def build_m3u(
             old_tvg_id = tvg_id_match.group(1).strip() if tvg_id_match else ""
 
             matched_id = resolve_epg_id(old_tvg_id, title, icons_by_id, name_to_id)
-            tv_logo_url = find_icon_url(matched_id, old_tvg_id, title, icons_by_id)
+            logo_url = find_icon_url(matched_id, old_tvg_id, title, icons_by_id, name_to_id)
 
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
 
             new_extinf = (
                 f'{prefix} tvg-id="{matched_id}" '
-                f'tvg-logo="{tv_logo_url}" tv-logo="{tv_logo_url}",{title}'
+                f'tvg-logo="{logo_url}" tv-logo="{logo_url}",{title}'
             )
 
             stream_url = ""
@@ -338,15 +347,18 @@ def build_m3u(
                 i += 1
 
             if stream_url:
+                total += 1
+                if logo_url:
+                    with_logo += 1
                 out_lines.append(new_extinf)
                 out_lines.append(stream_url)
         i += 1
 
-    return "\n".join(out_lines) + "\n"
+    return "\n".join(out_lines) + "\n", total, with_logo
 
 
 def main():
-    print("Đang tải M3U và EPG...")
+    print(f"Đang tải M3U và EPG ({EPG_URL})...")
     try:
         m3u_text = fetch_bytes(M3U_URL).decode("utf-8", errors="replace")
     except Exception as e:
@@ -359,7 +371,7 @@ def main():
     try:
         epg_bytes = fetch_bytes(EPG_URL)
         icons_by_id, name_to_id = parse_epg_channels(epg_bytes)
-        print(f"Đã đọc {len(icons_by_id)} kênh từ EPG.")
+        print(f"Đã đọc {len(icons_by_id)} kênh từ {EPG_URL}.")
     except urllib.error.HTTPError as e:
         print(f"Cảnh báo: Không tải được EPG (HTTP {e.code} {e.reason}).", file=sys.stderr)
     except Exception as e:
@@ -372,9 +384,9 @@ def main():
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
 
-    result_m3u = build_m3u(m3u_text, icons_by_id, name_to_id)
+    result_m3u, total, with_logo = build_m3u(m3u_text, icons_by_id, name_to_id)
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
-    print(f"Hoàn tất! Đã xuất file: {OUTPUT_FILE}")
+    print(f"Hoàn tất! Đã xuất {total} kênh ra {OUTPUT_FILE} (có logo từ EPG: {with_logo} kênh).")
 
 
 if __name__ == "__main__":
