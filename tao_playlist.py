@@ -186,10 +186,9 @@ def extract_icon_url(channel_elem: ET.Element) -> str:
     return ""
 
 
-def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str], set[str]]:
+def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]]:
     icons_by_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
-    known_epg_ids: set[str] = set()
 
     try:
         context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
@@ -197,7 +196,6 @@ def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]
             if elem.tag == "channel":
                 ch_id = (elem.attrib.get("id") or "").strip()
                 if ch_id:
-                    known_epg_ids.add(ch_id)
                     icon_url = extract_icon_url(elem)
                     if ch_id not in icons_by_id or icon_url:
                         icons_by_id[ch_id] = icon_url
@@ -217,7 +215,7 @@ def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]
     except ET.ParseError as e:
         print(f"Cảnh báo: XML EPG bị lỗi cú pháp giữa chừng ({e}).", file=sys.stderr)
 
-    return icons_by_id, name_to_id, known_epg_ids
+    return icons_by_id, name_to_id
 
 
 def get_mapped_default(old_tvg_id: str) -> str:
@@ -341,9 +339,9 @@ def build_m3u(
             title = title.strip()
 
             old_tvg_id = extract_attr(meta_part, "tvg-id")
-            existing_tvg_logo = extract_attr(meta_part, "tvg-logo")
             existing_tv_logo = extract_attr(meta_part, "tv-logo")
-            existing_logo = existing_tvg_logo or existing_tv_logo
+            existing_tvg_logo = extract_attr(meta_part, "tvg-logo")
+            existing_logo = existing_tv_logo or existing_tvg_logo
 
             matched_id, matched_epg = resolve_epg_id(
                 old_tvg_id, title, icons_by_id, name_to_id
@@ -361,7 +359,15 @@ def build_m3u(
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
 
-            logo_attrs = f' tvg-logo="{logo_url}" tv-logo="{logo_url}"' if logo_url else ""
+            if source_type == "existing":
+                logo_attrs = f' tv-logo="{logo_url}"'
+                if existing_tvg_logo:
+                    logo_attrs += f' tvg-logo="{existing_tvg_logo}"'
+            elif source_type == "epg":
+                logo_attrs = f' tv-logo="{logo_url}" tvg-logo="{logo_url}"'
+            else:
+                logo_attrs = ""
+
             new_extinf = f'{prefix} tvg-id="{matched_id}"{logo_attrs},{title}'
 
             stream_url = ""
@@ -401,7 +407,7 @@ def build_m3u(
 
 
 def main():
-    print(f"Đang tải M3U và EPG ({EPG_URL})...")
+    print(f"Đang tải M3U từ {M3U_URL} và EPG từ {EPG_URL}...")
     try:
         m3u_text = fetch_bytes(M3U_URL).decode("utf-8", errors="replace")
     except Exception as e:
@@ -413,7 +419,7 @@ def main():
 
     try:
         epg_bytes = fetch_bytes(EPG_URL)
-        icons_by_id, name_to_id, _ = parse_epg_channels(epg_bytes)
+        icons_by_id, name_to_id = parse_epg_channels(epg_bytes)
         print(f"Đã đọc {len(icons_by_id)} kênh từ {EPG_URL}.")
     except urllib.error.HTTPError as e:
         print(f"Cảnh báo: Không tải được EPG (HTTP {e.code} {e.reason}).", file=sys.stderr)
@@ -422,7 +428,7 @@ def main():
 
     if not icons_by_id and FALLBACK_EPG_FILE.exists():
         try:
-            icons_by_id, name_to_id, _ = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
+            icons_by_id, name_to_id = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
             print(f"Đã đọc {len(icons_by_id)} kênh từ {FALLBACK_EPG_FILE}.")
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
@@ -439,7 +445,7 @@ def main():
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
     print(
         f"Hoàn tất! Xuất {total} kênh ra {OUTPUT_FILE} "
-        f"(giữ logo cũ: {kept_existing}, lấy mới từ EPG: {fetched_from_epg})."
+        f"(giữ tv-logo có sẵn: {kept_existing}, lấy tv-logo từ EPG: {fetched_from_epg})."
     )
 
     if icons_by_id:
@@ -449,11 +455,11 @@ def main():
         else:
             print("Tất cả kênh đều khớp được EPG.")
 
-        print(f"\n=== Danh sách kênh chưa có logo ({len(missing_logos)}) ===")
+        print(f"\n=== Danh sách kênh chưa có tv-logo ({len(missing_logos)}) ===")
         if missing_logos:
             print("\n".join(missing_logos))
         else:
-            print("Tất cả kênh đều đã có logo.")
+            print("Tất cả kênh đều đã có tv-logo.")
     else:
         print("\nBỏ qua in danh sách khớp EPG/logo vì không tải được dữ liệu kênh từ EPG.")
 
