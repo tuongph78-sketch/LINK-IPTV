@@ -13,7 +13,10 @@ M3U_URL = os.getenv(
     "M3U_URL",
     "https://raw.githubusercontent.com/iptv-org/iptv/refs/heads/master/streams/vn.m3u",
 )
-EPG_URL = os.getenv("EPG_URL", "https://lichphatsong.io.vn/epg.xml").strip() or "https://lichphatsong.io.vn/epg.xml"
+EPG_URL = (
+    os.getenv("EPG_URL", "https://lichphatsong.io.vn/epg.xml").strip()
+    or "https://lichphatsong.io.vn/epg.xml"
+)
 FALLBACK_EPG_FILE = Path("epg_fallback.xml")
 OUTPUT_FILE = Path("output.m3u")
 
@@ -117,6 +120,8 @@ TVG_ID_MAP = {
     "VTV10.vn@HD": "vtv10hd",
 }
 
+TVG_ID_MAP_LOWER = {k.lower(): v for k, v in TVG_ID_MAP.items()}
+
 TITLE_FALLBACK_MAP = {
     "htv7": "htv7hd",
     "htv7 hd": "htv7hd",
@@ -181,33 +186,44 @@ def extract_icon_url(channel_elem: ET.Element) -> str:
     return ""
 
 
-def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str]]:
+def parse_epg_channels(xml_bytes: bytes) -> tuple[dict[str, str], dict[str, str], set[str]]:
     icons_by_id: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
-    context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
-    for _, elem in context:
-        if elem.tag == "channel":
-            ch_id = (elem.attrib.get("id") or "").strip()
-            if ch_id:
-                icon_url = extract_icon_url(elem)
-                if ch_id not in icons_by_id or icon_url:
-                    icons_by_id[ch_id] = icon_url
+    known_epg_ids: set[str] = set()
 
-                for disp_el in elem.findall("display-name"):
-                    disp_text = (disp_el.text or "").strip()
-                    if disp_text:
-                        norm = normalize_key(disp_text)
-                        no_accent = clean_alnum(disp_text)
-                        if norm and norm not in name_to_id:
-                            name_to_id[norm] = ch_id
-                        if no_accent and no_accent not in name_to_id:
-                            name_to_id[no_accent] = ch_id
-            elem.clear()
-        elif elem.tag == "programme":
-            elem.clear()
-            if icons_by_id:
-                break
-    return icons_by_id, name_to_id
+    try:
+        context = ET.iterparse(io.BytesIO(xml_bytes), events=("end",))
+        for _, elem in context:
+            if elem.tag == "channel":
+                ch_id = (elem.attrib.get("id") or "").strip()
+                if ch_id:
+                    known_epg_ids.add(ch_id)
+                    icon_url = extract_icon_url(elem)
+                    if ch_id not in icons_by_id or icon_url:
+                        icons_by_id[ch_id] = icon_url
+
+                    for disp_el in elem.findall("display-name"):
+                        disp_text = (disp_el.text or "").strip()
+                        if disp_text:
+                            norm = normalize_key(disp_text)
+                            no_accent = clean_alnum(disp_text)
+                            if norm and norm not in name_to_id:
+                                name_to_id[norm] = ch_id
+                            if no_accent and no_accent not in name_to_id:
+                                name_to_id[no_accent] = ch_id
+                elem.clear()
+            elif elem.tag == "programme":
+                elem.clear()
+    except ET.ParseError as e:
+        print(f"Cảnh báo: XML EPG bị lỗi cú pháp giữa chừng ({e}).", file=sys.stderr)
+
+    return icons_by_id, name_to_id, known_epg_ids
+
+
+def get_mapped_default(old_tvg_id: str) -> str:
+    if not old_tvg_id:
+        return ""
+    return TVG_ID_MAP.get(old_tvg_id) or TVG_ID_MAP_LOWER.get(old_tvg_id.lower(), "")
 
 
 def candidate_ids_from_raw(raw_id: str, title: str) -> list[str]:
@@ -249,36 +265,32 @@ def resolve_epg_id(
     title: str,
     icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
-) -> str:
-    mapped_default = TVG_ID_MAP.get(old_tvg_id, "")
-    if not mapped_default and old_tvg_id:
-        for k, v in TVG_ID_MAP.items():
-            if k.lower() == old_tvg_id.lower():
-                mapped_default = v
-                break
+) -> tuple[str, bool]:
+    mapped_default = get_mapped_default(old_tvg_id)
 
     if not icons_by_id:
-        return mapped_default or old_tvg_id
+        chosen = mapped_default or old_tvg_id
+        return chosen, bool(chosen)
 
-    if mapped_default and mapped_default in icons_by_id:
-        return mapped_default
+    if mapped_default:
+        return mapped_default, mapped_default in icons_by_id
 
     for cand in candidate_ids_from_raw(old_tvg_id, title):
         if cand in icons_by_id:
-            return cand
+            return cand, True
 
     clean_title = normalize_key(title)
     no_accent_title = clean_alnum(title)
     for key in (clean_title, no_accent_title):
         mapped_title_id = TITLE_FALLBACK_MAP.get(key)
         if mapped_title_id and mapped_title_id in icons_by_id:
-            return mapped_title_id
+            return mapped_title_id, True
 
     for key in (clean_title, no_accent_title):
         if key and key in name_to_id:
-            return name_to_id[key]
+            return name_to_id[key], True
 
-    return mapped_default or old_tvg_id
+    return old_tvg_id, False
 
 
 def find_icon_url(
@@ -312,12 +324,14 @@ def build_m3u(
     m3u_text: str,
     icons_by_id: dict[str, str],
     name_to_id: dict[str, str],
-) -> tuple[str, int, int, int]:
+) -> tuple[str, int, int, int, list[str], list[str]]:
     lines = [line.strip() for line in m3u_text.splitlines() if line.strip()]
     out_lines = ["#EXTM3U"]
     total = 0
     kept_existing = 0
     fetched_from_epg = 0
+    unmatched_epg_ids: list[str] = []
+    missing_logos: list[str] = []
 
     i = 0
     while i < len(lines):
@@ -331,22 +345,24 @@ def build_m3u(
             existing_tv_logo = extract_attr(meta_part, "tv-logo")
             existing_logo = existing_tvg_logo or existing_tv_logo
 
-            matched_id = resolve_epg_id(old_tvg_id, title, icons_by_id, name_to_id)
+            matched_id, matched_epg = resolve_epg_id(
+                old_tvg_id, title, icons_by_id, name_to_id
+            )
 
             if existing_logo:
                 logo_url = existing_logo
                 source_type = "existing"
             else:
-                logo_url = find_icon_url(matched_id, old_tvg_id, title, icons_by_id, name_to_id)
+                logo_url = find_icon_url(
+                    matched_id, old_tvg_id, title, icons_by_id, name_to_id
+                )
                 source_type = "epg" if logo_url else "none"
 
             dur_match = re.match(r"^(#EXTINF:[^\s,]+)", meta_part)
             prefix = dur_match.group(1) if dur_match else "#EXTINF:-1"
 
-            new_extinf = (
-                f'{prefix} tvg-id="{matched_id}" '
-                f'tvg-logo="{logo_url}" tv-logo="{logo_url}",{title}'
-            )
+            logo_attrs = f' tvg-logo="{logo_url}" tv-logo="{logo_url}"' if logo_url else ""
+            new_extinf = f'{prefix} tvg-id="{matched_id}"{logo_attrs},{title}'
 
             stream_url = ""
             if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
@@ -359,11 +375,29 @@ def build_m3u(
                     kept_existing += 1
                 elif source_type == "epg":
                     fetched_from_epg += 1
+
+                if not matched_epg:
+                    unmatched_epg_ids.append(
+                        f"- {title or '(Không tên)'} | old tvg-id: '{old_tvg_id}' | current tvg-id: '{matched_id}'"
+                    )
+
+                if not logo_url:
+                    missing_logos.append(
+                        f"- {title or '(Không tên)'} | old tvg-id: '{old_tvg_id}' | current tvg-id: '{matched_id}'"
+                    )
+
                 out_lines.append(new_extinf)
                 out_lines.append(stream_url)
         i += 1
 
-    return "\n".join(out_lines) + "\n", total, kept_existing, fetched_from_epg
+    return (
+        "\n".join(out_lines) + "\n",
+        total,
+        kept_existing,
+        fetched_from_epg,
+        unmatched_epg_ids,
+        missing_logos,
+    )
 
 
 def main():
@@ -379,7 +413,7 @@ def main():
 
     try:
         epg_bytes = fetch_bytes(EPG_URL)
-        icons_by_id, name_to_id = parse_epg_channels(epg_bytes)
+        icons_by_id, name_to_id, _ = parse_epg_channels(epg_bytes)
         print(f"Đã đọc {len(icons_by_id)} kênh từ {EPG_URL}.")
     except urllib.error.HTTPError as e:
         print(f"Cảnh báo: Không tải được EPG (HTTP {e.code} {e.reason}).", file=sys.stderr)
@@ -388,17 +422,40 @@ def main():
 
     if not icons_by_id and FALLBACK_EPG_FILE.exists():
         try:
-            icons_by_id, name_to_id = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
+            icons_by_id, name_to_id, _ = parse_epg_channels(FALLBACK_EPG_FILE.read_bytes())
             print(f"Đã đọc {len(icons_by_id)} kênh từ {FALLBACK_EPG_FILE}.")
         except Exception as e:
             print(f"Cảnh báo: Không đọc được {FALLBACK_EPG_FILE} ({e}).", file=sys.stderr)
 
-    result_m3u, total, kept_existing, fetched_from_epg = build_m3u(m3u_text, icons_by_id, name_to_id)
+    (
+        result_m3u,
+        total,
+        kept_existing,
+        fetched_from_epg,
+        unmatched_epg_ids,
+        missing_logos,
+    ) = build_m3u(m3u_text, icons_by_id, name_to_id)
+
     OUTPUT_FILE.write_text(result_m3u, encoding="utf-8")
     print(
         f"Hoàn tất! Xuất {total} kênh ra {OUTPUT_FILE} "
         f"(giữ logo cũ: {kept_existing}, lấy mới từ EPG: {fetched_from_epg})."
     )
+
+    if icons_by_id:
+        print(f"\n=== Danh sách kênh chưa khớp tvg-id với EPG ({len(unmatched_epg_ids)}) ===")
+        if unmatched_epg_ids:
+            print("\n".join(unmatched_epg_ids))
+        else:
+            print("Tất cả kênh đều khớp được EPG.")
+
+        print(f"\n=== Danh sách kênh chưa có logo ({len(missing_logos)}) ===")
+        if missing_logos:
+            print("\n".join(missing_logos))
+        else:
+            print("Tất cả kênh đều đã có logo.")
+    else:
+        print("\nBỏ qua in danh sách khớp EPG/logo vì không tải được dữ liệu kênh từ EPG.")
 
 
 if __name__ == "__main__":
