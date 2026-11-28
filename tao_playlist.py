@@ -42,7 +42,7 @@ TVG_ID_MAP = {
     "HanoiTV2.vn@SD": "hanoi2",
     "HTV1.vn@SD": "htv1",
     "HTV1.vn@HD": "htv1",
-    "HTV2.vn@HD": "htv2hd",
+    "HTV2.vn@HD": "htv2",
     "HTV3.vn@SD": "htv3",
     "HTV3.vn@HD": "htv3",
     "HTV4.vn@HD": "htv4",
