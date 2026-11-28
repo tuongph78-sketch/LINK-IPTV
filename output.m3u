@@ -55,9 +55,9 @@ https://liveh34.vtvprime.vn/hls/HANOI1TV/index.m3u8
 https://freem3u.xyz/api/live/play.m3u8?vid=190
 #EXTINF:-1 tvg-id="htv1",HTV1 (720p)
 https://dethich.pw/htv1/index.m3u8
-#EXTINF:-1 tvg-id="htv2hd",HTV2 (1080p)
+#EXTINF:-1 tvg-id="htv2",HTV2 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=191
-#EXTINF:-1 tvg-id="htv2hd",HTV2 (720p)
+#EXTINF:-1 tvg-id="htv2",HTV2 (720p)
 https://dethich.pw/htv2/index.m3u8
 #EXTINF:-1 tvg-id="htv3",HTV3 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=192
@@ -107,6 +107,8 @@ https://freem3u.xyz/api/live/play.m3u8?vid=178
 https://freem3u.xyz/api/live/play.m3u8?vid=176
 #EXTINF:-1 tvg-id="onechannel",ON E Channel (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=182
+#EXTINF:-1 tvg-id="ONGolf.vn@SD",ON Golf (1080p)
+https://vmttv.dpdns.org/tv360/?id=vtvcab-23-golf-channel
 #EXTINF:-1 tvg-id="oninfotv",ON Info TV (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=189
 #EXTINF:-1 tvg-id="onkids",ON Kids (720p)
